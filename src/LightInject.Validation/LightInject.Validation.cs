@@ -26,6 +26,10 @@
     http://twitter.com/bernhardrichter
 ******************************************************************************/
 
+using System.Collections.ObjectModel;
+using System.Reflection;
+using Type = System.Type;
+
 [module: System.Diagnostics.CodeAnalysis.SuppressMessage("StyleCop.CSharp.ReadabilityRules", "SA1126:PrefixCallsCorrectly", Justification = "Reviewed")]
 [module: System.Diagnostics.CodeAnalysis.SuppressMessage("StyleCop.CSharp.ReadabilityRules", "SA1101:PrefixLocalCallsWithThis", Justification = "No inheritance")]
 [module: System.Diagnostics.CodeAnalysis.SuppressMessage("StyleCop.CSharp.MaintainabilityRules", "SA1402:FileMayOnlyContainASingleClass", Justification = "Single source file deployment.")]
@@ -40,66 +44,252 @@ namespace LightInject.Validation
     using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Linq;
+    using ServiceMap = System.Collections.Generic.Dictionary<Type, System.Collections.Generic.Dictionary<string, ServiceRegistration>>;
 
     public static class ContainerExtensions
     {
-        private static ConcurrentDictionary<Type, int> lifeSpans = new ConcurrentDictionary<Type, int>();
+        private static readonly ConcurrentDictionary<Type, int> LifeSpans = new ConcurrentDictionary<Type, int>();
+
+        private const string NotDisposeMessage =
+            @"The service {0} being injected as a constructor argument into {1} implements IDisposable" +
+            "but is registered without a lifetime (transient). LightInject will not be able to dispose the instance represented by {0}" +
+            "If the intent was to manually control the instantiation and destruction, inject Func<{0}> instead." +
+            "Otherwise register `{0}` with a lifetime (PerContainer, PerRequest or PerScope).";
+
+        private const string MissingDependency =
+                "Class: 'NameSpace.Foo', Parameter 'NameSpace.IBar bar' -> The injected service NameSpace IBar is not registered."
+            ;
 
         static ContainerExtensions()
         {
-            lifeSpans.TryAdd(typeof(PerRequestLifeTime), 10);
-            lifeSpans.TryAdd(typeof(PerScopeLifetime), 20);
-            lifeSpans.TryAdd(typeof(PerContainerLifetime), 30);
+            LifeSpans.TryAdd(typeof(PerRequestLifeTime), 10);
+            LifeSpans.TryAdd(typeof(PerScopeLifetime), 20);
+            LifeSpans.TryAdd(typeof(PerContainerLifetime), 30);
         }
-    
-        public static void Validate(this ServiceContainer container, Action<string> warnAction)
-        {            
-            var constructorSelector = container.ConstructorSelector;
-            var serviceMap = container.AvailableServices.ToDictionary(sr => (sr.ServiceType, sr.ServiceName));//                        
-            foreach (var service in container.AvailableServices)
+
+        public static IEnumerable<ValidationResult> Validate(this ServiceContainer container)
+        {
+            var serviceMap = container.AvailableServices.GroupBy(sr => sr.ServiceType).ToDictionary(gr => gr.Key,
+                gr => gr.ToDictionary(sr => sr.ServiceName, sr => sr, StringComparer.OrdinalIgnoreCase));
+
+
+            var verifyableServices = container.AvailableServices.Where(sr => sr.ImplementingType != null);
+
+            return verifyableServices.SelectMany(sr =>
+                ValidateConstructor(serviceMap, sr, container.ConstructorSelector.Execute(sr.ImplementingType)));
+        }
+
+        private static IReadOnlyCollection<ValidationResult> ValidateConstructor(ServiceMap serviceMap,
+            ServiceRegistration serviceRegistration, ConstructorInfo constructorInfo)
+        {
+            var result = new Collection<ValidationResult>();
+
+            foreach (var parameter in constructorInfo.GetParameters())
             {
-                ValidateService(serviceMap, service, constructorSelector, warnAction);                        
+                Type parameterType = parameter.ParameterType;
+
+                if (parameterType.GetTypeInfo().IsGenericType && parameterType.GetTypeInfo().ContainsGenericParameters)
+                {
+                    parameterType = parameterType.GetGenericTypeDefinition();
+                }
+
+                var dependencyRegistration = GetDependencyRegistration(serviceMap, parameterType, parameter.Name);
+                if (dependencyRegistration == null)
+                {
+                    if (serviceMap.TryGetValue(parameterType, out var registrations))
+                    {
+                        if (registrations.Count > 1)
+                        {
+                            result.Add(new ValidationResult("",ValidationSeverity.Ambiguous, parameter));
+                        }
+                    }
+
+
+                    if (parameter.ParameterType.IsFunc())
+                    {
+                        dependencyRegistration = GetDependencyRegistration(serviceMap,
+                            parameterType.GenericTypeArguments[0], string.Empty);
+                        if (dependencyRegistration == null)
+                        {
+                            result.Add(
+                                new ValidationResult("Missing func target", ValidationSeverity.MissingDependency,
+                                    parameter));
+                        }
+                    }
+                    else if (parameter.ParameterType.IsLazy())
+                    {
+                        dependencyRegistration = GetDependencyRegistration(serviceMap,
+                            parameterType.GenericTypeArguments[0], string.Empty);
+                        if (dependencyRegistration == null)
+                        {
+                            result.Add(
+                                new ValidationResult("Missing Lazy target", ValidationSeverity.MissingDependency,
+                                    parameter));
+                        }
+                    }
+                    else
+                    {
+                        result.Add(new ValidationResult("Missing dependency", ValidationSeverity.MissingDependency, parameter));
+                        
+                    }
+                    
+                }
+
+                if (dependencyRegistration == null)
+                {
+                   continue;
+                }
+
+
+                var lifeTimeValdation = ValidateLifetime(serviceRegistration, dependencyRegistration, parameter);
+                if (lifeTimeValdation != null)
+                {
+                    result.Add(lifeTimeValdation);
+                }
+
+
+
+
+                if (dependencyRegistration.Lifetime == null)
+                {
+                    if (dependencyRegistration.ServiceType.Implements<IDisposable>())
+                    {
+                        result.Add(new ValidationResult(
+                             $"The service type '{dependencyRegistration.ServiceType}' implements 'IDisposable'",
+                             ValidationSeverity.NotDisposed, parameter));
+
+                    }
+
+                    else if (dependencyRegistration.ImplementingType != null && dependencyRegistration.ImplementingType.Implements<IDisposable>())
+                    {
+                        result.Add(new ValidationResult(
+                            $"The service type '{dependencyRegistration.ServiceType}' implements 'IDisposable'",
+                            ValidationSeverity.NotDisposed, parameter));
+                    }
+                }
+
             }
+            return result;
+        }
+         
+
+        private static ValidationResult ValidateLifetime(ServiceRegistration serviceRegistration,
+            ServiceRegistration dependencyRegistration, ParameterInfo parameter)
+        {
+            if (GetLifespan(serviceRegistration.Lifetime) > GetLifespan(dependencyRegistration.Lifetime))
+            {
+                return new ValidationResult("Missing dependency", ValidationSeverity.Captive, parameter);
+            }
+            return null;
         }
 
         public static void SetLifespan<TLifetime>(int lifeSpan) where TLifetime : ILifetime
         {
-            lifeSpans.AddOrUpdate(typeof(TLifetime), t => lifeSpan, (t,l) => lifeSpan);
+            LifeSpans.AddOrUpdate(typeof(TLifetime), t => lifeSpan, (t, l) => lifeSpan);
         }
 
-        private static void ValidateService(Dictionary<(Type, string), ServiceRegistration> servicemap ,ServiceRegistration registration, IConstructorSelector constructorSelector, Action<string> warnAction)
+
+
+        private static ServiceRegistration GetDependencyRegistration(
+            ServiceMap servicemap,
+            Type parameterType, string serviceName)
         {
-            if (registration.ImplementingType != null)
+
+            if (!servicemap.TryGetValue(parameterType, out var registrations))
             {
-                var constructor = constructorSelector.Execute(registration.ImplementingType);
-                var parameters = constructor.GetParameters();
-                foreach (var parameter in parameters)
-                {
-                    if (servicemap.TryGetValue((parameter.ParameterType, string.Empty), out var dependency))
-                    {
-                        if (GetLifespan(registration.Lifetime, warnAction) > GetLifespan(dependency.Lifetime, warnAction))
-                        {
-                            warnAction($"The dependency {dependency} is being injected into {registration} that has a longer lifetime");
-                        }
-                    }
-                }
-            }   
+                return null;
+            }
+
+            if (registrations.TryGetValue(string.Empty, out var registration))
+            {
+                return registration;
+            }
+
+            if (registrations.Count == 1)
+            {
+                return registrations.Values.First();
+            }
+
+            if (registrations.TryGetValue(serviceName, out registration))
+            {
+                return registration;
+            }
+
+
+
+
+            return null;
         }
 
-        private static int GetLifespan(ILifetime lifetime, Action<string> warnAction)
+
+        private static string GetLifetimeName(ILifetime lifetime)
+        {
+            if (lifetime == null)
+            {
+                return "Transient";
+            }
+            return lifetime.GetType().Name;
+        }
+
+
+        private static int GetLifespan(ILifetime lifetime)
         {
             if (lifetime == null)
             {
                 return 0;
             }
-            if (lifeSpans.TryGetValue(lifetime.GetType(), out var lifespan))
+            if (LifeSpans.TryGetValue(lifetime.GetType(), out var lifespan))
             {
                 return lifespan;
             }
-            warnAction(
-                $"The lifetime {lifespan.GetType()} does not have an expected lifespan. Use the SetLifespan method to specify the lifespan.");
             return 0;
         }
-        
+
+
+
+    }
+
+    public class ValidationResult
+    {
+        public ValidationResult(string message, ValidationSeverity severity, ParameterInfo parameter)
+        {
+            Message = message;
+            Severity = severity;
+            Parameter = parameter;
+        }
+
+        public string Message { get; }
+
+        public ValidationSeverity Severity { get; }
+        public ParameterInfo Parameter { get; }
+    }
+
+    public enum ValidationSeverity
+    {
+        NoIssues,
+        Captive,
+        NotDisposed,
+        MissingDependency,
+        Ambiguous
+    }
+
+    internal static class TypeExtensions
+    {
+        public static bool Implements<TBaseType>(this Type type)
+        {
+            return type.GetTypeInfo().ImplementedInterfaces.Contains(typeof(TBaseType));
+        }
+
+        public static bool IsFunc(this Type type)
+        {
+            var typeInfo = type.GetTypeInfo();
+            return typeInfo.IsGenericType && typeInfo.GetGenericTypeDefinition() == typeof(Func<>);
+        }
+
+        public static bool IsLazy(this Type type)
+        {
+            var typeInfo = type.GetTypeInfo();
+            return typeInfo.IsGenericType && typeInfo.GetGenericTypeDefinition() == typeof(Lazy<>);
+        }
     }
 }
