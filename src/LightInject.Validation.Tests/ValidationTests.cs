@@ -45,6 +45,19 @@ namespace LightInject.Validation.Tests
         }
 
         [Fact]
+        public void ShouldReportMissingDependency()
+        {
+            var container = new ServiceContainer();
+            container.Register<Foo<IBar>>();
+
+            var result = container.Validate().ToArray();
+
+            result.Should().Contain(r => r.Severity == ValidationSeverity.MissingDependency);
+        }
+
+
+
+        [Fact]
         public void ShouldReportNotDisposedWhenRegisteringDisposableServiceTypesAsTransient()
         {
             var container = new ServiceContainer();

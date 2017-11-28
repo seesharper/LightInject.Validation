@@ -86,59 +86,14 @@ namespace LightInject.Validation
 
             foreach (var parameter in constructorInfo.GetParameters())
             {
-                Type parameterType = parameter.ParameterType;
-
-                if (parameterType.GetTypeInfo().IsGenericType && parameterType.GetTypeInfo().ContainsGenericParameters)
-                {
-                    parameterType = parameterType.GetGenericTypeDefinition();
-                }
-
-                var dependencyRegistration = GetDependencyRegistration(serviceMap, parameterType, parameter.Name);
+                var dependencyRegistration =
+                    GetServiceRegistration(serviceMap, new ValidationTarget(parameter), result);
                 if (dependencyRegistration == null)
                 {
-                    if (serviceMap.TryGetValue(parameterType, out var registrations))
-                    {
-                        if (registrations.Count > 1)
-                        {
-                            result.Add(new ValidationResult("",ValidationSeverity.Ambiguous, parameter));
-                        }
-                    }
-
-
-                    if (parameter.ParameterType.IsFunc())
-                    {
-                        dependencyRegistration = GetDependencyRegistration(serviceMap,
-                            parameterType.GenericTypeArguments[0], string.Empty);
-                        if (dependencyRegistration == null)
-                        {
-                            result.Add(
-                                new ValidationResult("Missing func target", ValidationSeverity.MissingDependency,
-                                    parameter));
-                        }
-                    }
-                    else if (parameter.ParameterType.IsLazy())
-                    {
-                        dependencyRegistration = GetDependencyRegistration(serviceMap,
-                            parameterType.GenericTypeArguments[0], string.Empty);
-                        if (dependencyRegistration == null)
-                        {
-                            result.Add(
-                                new ValidationResult("Missing Lazy target", ValidationSeverity.MissingDependency,
-                                    parameter));
-                        }
-                    }
-                    else
-                    {
-                        result.Add(new ValidationResult("Missing dependency", ValidationSeverity.MissingDependency, parameter));
-                        
-                    }
-                    
+                    return result;
                 }
 
-                if (dependencyRegistration == null)
-                {
-                   continue;
-                }
+                
 
 
                 var lifeTimeValdation = ValidateLifetime(serviceRegistration, dependencyRegistration, parameter);
@@ -171,7 +126,7 @@ namespace LightInject.Validation
             }
             return result;
         }
-         
+                    
 
         private static ValidationResult ValidateLifetime(ServiceRegistration serviceRegistration,
             ServiceRegistration dependencyRegistration, ParameterInfo parameter)
@@ -189,14 +144,27 @@ namespace LightInject.Validation
         }
 
 
+                
 
-        private static ServiceRegistration GetDependencyRegistration(
-            ServiceMap servicemap,
-            Type parameterType, string serviceName)
+        private static ServiceRegistration GetServiceRegistration(ServiceMap serviceMap, ValidationTarget validationTarget, ICollection<ValidationResult> result)
         {
 
-            if (!servicemap.TryGetValue(parameterType, out var registrations))
+            if (!serviceMap.TryGetValue(validationTarget.ServiceType, out var registrations))
             {
+                if (validationTarget.ServiceType.IsFunc() || validationTarget.ServiceType.IsLazy())
+                {
+                    var underLyingRegistration =  GetServiceRegistration(serviceMap,
+                        validationTarget.WithServiceDescription(validationTarget.ServiceType.GenericTypeArguments[0],
+                            string.Empty), result);
+                    if (underLyingRegistration == null)
+                    {
+                        result.Add(new ValidationResult("",ValidationSeverity.MissingDependency, validationTarget.Parameter));
+                    }
+                }
+                else
+                {
+                    result.Add(new ValidationResult("", ValidationSeverity.MissingDependency, validationTarget.Parameter));
+                }
                 return null;
             }
 
@@ -210,16 +178,22 @@ namespace LightInject.Validation
                 return registrations.Values.First();
             }
 
-            if (registrations.TryGetValue(serviceName, out registration))
+            if (registrations.TryGetValue(validationTarget.ServiceName, out registration))
             {
                 return registration;
             }
 
+            if (registrations.Count > 1)
+            {
+                result.Add(new ValidationResult("", ValidationSeverity.Ambiguous, validationTarget.Parameter));
+            }
 
 
-
+            
+            result.Add(new ValidationResult("", ValidationSeverity.MissingDependency,validationTarget.Parameter));
             return null;
         }
+
 
 
         private static string GetLifetimeName(ILifetime lifetime)
@@ -248,6 +222,46 @@ namespace LightInject.Validation
 
 
     }
+
+
+
+
+    public class ValidationTarget
+    {
+        public ParameterInfo Parameter { get; }
+        public Type ServiceType { get; }
+        public string ServiceName { get; }
+
+
+        public ValidationTarget(ParameterInfo parameter) : this(parameter, parameter.ParameterType, parameter.Name)
+        {
+        }
+
+
+        public ValidationTarget(ParameterInfo parameter, Type serviceType, string serviceName)
+        {
+            Parameter = parameter;
+            ServiceType = serviceType;
+            ServiceName = serviceName;
+           
+
+            if (serviceType.GetTypeInfo().IsGenericType && serviceType.GetTypeInfo().ContainsGenericParameters)
+            {
+                ServiceType = serviceType.GetGenericTypeDefinition();
+            }
+
+        }
+
+        public ValidationTarget WithServiceDescription(Type serviceType, string serviceName)
+        {
+            return new ValidationTarget(Parameter, serviceType, serviceName);
+        }
+
+    }
+
+
+   
+
 
     public class ValidationResult
     {
