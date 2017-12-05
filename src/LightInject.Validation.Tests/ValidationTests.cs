@@ -18,6 +18,8 @@ namespace LightInject.Validation.Tests
             var result = container.Validate().ToArray();
 
             result.Should().Contain(r => r.Severity == ValidationSeverity.Captive);
+            result.Should().NotContain(r => string.IsNullOrEmpty(r.Message));
+            result.Should().Contain(r => r.ValidationTarget != null);
         }
 
         [Fact]
@@ -55,6 +57,20 @@ namespace LightInject.Validation.Tests
             result.Should().Contain(r => r.Severity == ValidationSeverity.MissingDependency);
         }
 
+        [Fact]
+        public void ShoudNotReportMissingDependencyWhenSingleNamedServiceIsRegistered()
+        {
+            var container = new ServiceContainer();
+            container.Register<Foo>();
+            
+            //Possible missing overload in LightInject 
+            //Register<Bar>("ServiceName");
+            container.Register<Bar>(f => new Bar(), "SomeBar");
+
+            var result = container.Validate();
+
+            result.Should().BeEmpty();
+        }
 
 
         [Fact]
@@ -142,6 +158,22 @@ namespace LightInject.Validation.Tests
             result.Should().Contain(r => r.Severity == ValidationSeverity.Ambiguous);
         }
 
+        [Fact]
+        public void ShouldBeAbleToRegisterCustomLifetime()
+        {
+            var container = new ServiceContainer();
+            // Put the custom lifetime between PerScope and PerContainer               
+            Validation.SetLifespan<CustomLifetime>(25);
+
+            container.Register<Foo>(new PerContainerLifetime());
+            container.Register<Bar>(new CustomLifetime());
+
+            var result = container.Validate();
+
+            result.Should().Contain(r =>
+                r.Message.Contains("CustomLifetime") && r.Severity == ValidationSeverity.Captive);
+
+        }
 
 
         [Fact]
@@ -265,6 +297,14 @@ namespace LightInject.Validation.Tests
     public class BarImplementingIDisposableBar : IDisposableBar
     {
         public void Dispose()
+        {
+            throw new NotImplementedException();
+        }
+    }
+
+    public class CustomLifetime : ILifetime
+    {
+        public object GetInstance(Func<object> createInstance, Scope scope)
         {
             throw new NotImplementedException();
         }
